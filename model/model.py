@@ -2,7 +2,7 @@ import numpy as np
 
 
 class KohonenNetwork:
-    def __init__(self, grid_shape, input_dim, lambda_param, neighborhood_type='gaussian'):
+    def __init__(self, grid_shape, input_dim, lambda_param, neighborhood_type='gaussian', topology='rectangular', normalize_data=False):
         """
         Initialization of the Kohonen Network (SOM).
 
@@ -12,17 +12,41 @@ class KohonenNetwork:
         - lambda_param: The lambda parameter for learning rate decay.
         - neighborhood_type: The type of neighborhood function ('gaussian' or 'mexican_hat').
         """
-        self.M, self.N = grid_shape
+        self.M, self.N = grid_shape # Left for other functions
+        self.grid_shape = grid_shape
         self.input_dim = input_dim
         self.lambda_param = lambda_param
         self.neighborhood_type = neighborhood_type
+        self.topology = topology
 
-        # 1. Initialize neuron weights
-        self.weights = np.random.rand(self.M, self.N, self.input_dim)
+        self.normalize_data = normalize_data
+        self.data_min = None
+        self.data_max = None
 
-        # 2. Optimization: prepare grid coordinates
-        x, y = np.mgrid[0:self.M, 0:self.N]
-        self.grid_coords = np.column_stack([x.ravel(), y.ravel()])
+        self.weights = np.random.rand(self.grid_shape[0], self.grid_shape[1], self.input_dim)
+
+        self._precompute_grid_coordinates()
+
+    def _precompute_grid_coordinates(self):
+        """
+        Precomputes the physical (x, y) spatial coordinates for each neuron
+        based on the selected topology.
+        """
+        M, N = self.grid_shape
+        # Create a grid of shape (M, N, 2) to store x and y for each neuron
+        self.spatial_coords = np.zeros((M, N, 2))
+
+        for i in range(M):
+            for j in range(N):
+                if self.topology == 'hexagonal':
+                    # Shift odd rows by 0.5 and scale y by sqrt(3)/2
+                    x = j + 0.5 * (i % 2)
+                    y = i * (np.sqrt(3) / 2)
+                else:
+                    # Standard rectangular grid
+                    x = j
+                    y = i
+                self.spatial_coords[i, j] = [x, y]
 
     def _find_bmu(self, x):
         """
@@ -65,30 +89,21 @@ class KohonenNetwork:
         - A 2D numpy array of shape (M, N) containing the neighborhood
           influence value (strength of learning) for each neuron.
         """
-        # 1. Convert BMU coordinates to a numpy array for vectorized math
-        bmu_coords_arr = np.array(bmu_coords)
+        # Get the physical (x, y) coordinates of the BMU
+        bmu_spatial = self.spatial_coords[bmu_coords[0], bmu_coords[1]]
 
-        # 2. Calculate squared distances on the 2D grid
-        squared_distances = np.sum((self.grid_coords - bmu_coords_arr) ** 2, axis=1)
+        # Calculate squared Euclidean distances between BMU and all other neurons' spatial positions
+        squared_distances = np.sum((self.spatial_coords - bmu_spatial) ** 2, axis=2)
 
-        # Reshape the flat list of distances back into our M x N grid format
-        squared_distances = squared_distances.reshape(self.M, self.N)
-
-        # 3. Apply the selected neighborhood function
         if self.neighborhood_type == 'gaussian':
-            influence = np.exp(-squared_distances / (2 * (sigma ** 2)))
+            return np.exp(-squared_distances / (2 * (sigma ** 2)))
 
         elif self.neighborhood_type == 'mexican_hat':
-            term1 = 1 - (squared_distances / (sigma ** 2))
-            term2 = np.exp(-squared_distances / (2 * (sigma ** 2)))
+            s2 = sigma ** 2
+            term1 = 1 - (squared_distances / s2)
+            term2 = np.exp(-squared_distances / (2 * s2))
             influence = term1 * term2
-
-            influence = np.clip(influence, -1.0, 1.0)
-
-        else:
-            raise ValueError("Invalid neighborhood_type. Choose 'gaussian' or 'mexican_hat'.")
-
-        return influence
+            return np.clip(influence, -0.1, 1.0)
 
     def train(self, data, num_epochs, sigma):
         """
@@ -99,8 +114,19 @@ class KohonenNetwork:
         - num_epochs: Number of times to iterate over the entire dataset.
         - sigma: The neighborhood radius parameter.
         """
+        training_data = data.copy()
+
+        if self.normalize_data:
+            self.data_min = training_data.min(axis=0)
+            self.data_max = training_data.max(axis=0)
+
+            range_values = self.data_max - self.data_min
+            range_values[range_values == 0] = 1e-8
+
+            training_data = (training_data - training_data.min()) / range_values
+
         current_iteration = 0
-        indices = np.arange(len(data))
+        indices = np.arange(len(training_data))
 
         for epoch in range(num_epochs):
             # 1. Shuffle data at the beginning of each epoch
@@ -108,7 +134,7 @@ class KohonenNetwork:
 
             for i in indices:
                 # Shuffled pick
-                x = data[i]
+                x = training_data[i]
 
                 # 2. Calculate learning rate for the current time step
                 alpha = self._decay_learning_rate(current_iteration)
@@ -125,8 +151,10 @@ class KohonenNetwork:
                 # The core Kohonen learning rule:
                 # W_new = W_old + alpha * neighborhood_influence * (Input - W_old)
                 self.weights += alpha * influence_expanded * (x - self.weights)
+                clip_min = 0.0 if self.normalize_data else training_data.min()
+                clip_max = 1.0 if self.normalize_data else training_data.max()
 
-                self.weights = np.clip(self.weights, data.min(), data.max())
+                self.weights = np.clip(self.weights, clip_min, clip_max)
 
                 current_iteration += 1
 
@@ -142,8 +170,18 @@ class KohonenNetwork:
         - A list of tuples, where each tuple contains the (row, col) coordinates
           of the BMU for the corresponding input sample.
         """
-        # We iterate over all samples in the provided data
-        # and use our previously defined _find_bmu method for each of them.
-        predictions = [self._find_bmu(x) for x in data]
+        eval_data = data.copy()
 
-        return predictions
+        if self.normalize_data:
+            if self.data_min is None or self.data_max is None:
+                raise ValueError('Model must be trained before calling predict()')
+
+            range_values = self.data_max - self.data_min
+            range_values[range_values == 0] = 1e-8
+            eval_data = (eval_data - eval_data.min()) / range_values
+
+        bmu_predictions = []
+        for x in eval_data:
+            bmu_predictions.append(self._find_bmu(x))
+
+        return bmu_predictions
